@@ -22,37 +22,28 @@ for (int y = 0; y < 128; y++)
 // Do something with this data...
 ```
 
-## Analytic OpenSimplex2S gradients (C++ fork extension)
+## Analytic OpenSimplex2S derivatives (C++ fork extension)
 
-This fork adds `FastNoiseLite::NoiseGradient3D`, containing `value`, `dx`, `dy`,
-and `dz`, and `GetOpenSimplex2SWithGradient(x, y, z)`. Both float and double
+The C++ fork adds `NoiseGradient3D` and `NoiseHessian3D`, returned by
+`GetOpenSimplex2SWithGradient(x, y, z)` and
+`GetOpenSimplex2SWithHessian(x, y, z)`. The Hessian is stored as
+`sample.hessian[row][column]`, in input-coordinate order. Float and double
 coordinates are accepted; the kernel and returned components use float
 arithmetic.
 
-```cpp
-FastNoiseLite noise(123);
-noise.SetFrequency(1.0f);
-auto sample = noise.GetOpenSimplex2SWithGradient(0.2, -0.4, 0.8);
-// sample.value: noise; sample.dx/dy/dz: derivatives in the input coordinates.
-```
+Both APIs sample raw 3D OpenSimplex2S with the configured seed, frequency, and
+`RotationType3D`, regardless of the selected noise type or fractal mode. Values
+and gradients match their existing APIs exactly. The gradient and Hessian
+include the orientation/frequency transforms; the Hessian applies those
+transforms on both axes. Existing value and gradient-only calls do not
+instantiate Hessian accumulation. No numerical derivatives are used in
+production.
 
-The new method always samples raw 3D OpenSimplex2S. It honors seed, frequency,
-and `RotationType3D`, independently of the selected noise type or fractal mode.
-Its value matches `GetNoise` configured with `NoiseType_OpenSimplex2S` and
-`FractalType_None`. Internal rotation and frequency are included in the returned
-derivatives. Floating-point coordinate quantization is not differentiated.
-
-Value and gradient share the corrected lattice traversal, hashes, gradient
-tables, and normalization. Four opposite-corner pairs on each of the two
-cubic lattices supply eight candidates in total. This covers every positive
-contribution: opposite vertices are twice the support radius apart, so the
-unselected member cannot have positive support. At a pair-selection boundary
-both contributions are zero.
-
-Value-only calls instantiate the same traversal without gradient calculations
-or gradient allocations. No finite differences are used in production. This
-API provides first derivatives only; it does not add gradient APIs to fractals,
-domain warps, other algorithms, or other language ports.
+The three-dimensional kernel uses eight support candidates: four opposite
+corner pairs on each of two offset cubic lattices. This includes every positive
+contribution while preserving the established hash/index mapping and
+normalization. The compact-support contribution Hessians join continuously
+across support boundaries in real arithmetic.
 
 Run the standalone C++ regression check from the repository root:
 

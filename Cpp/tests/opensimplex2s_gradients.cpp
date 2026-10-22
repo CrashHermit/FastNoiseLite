@@ -148,6 +148,43 @@ int main()
                 }
             }
         }
+        int hessian_checked = 0;
+        for (auto rotation : {FastNoiseLite::RotationType3D_None,
+            FastNoiseLite::RotationType3D_ImproveXYPlanes,
+            FastNoiseLite::RotationType3D_ImproveXZPlanes})
+        {
+            FastNoiseLite noise(907);
+            noise.SetRotationType3D(rotation);
+            for (float frequency : {0.37f, -0.61f})
+            {
+                noise.SetFrequency(frequency);
+                const double point[3] = {0.37, -0.81, 1.13};
+                const auto sample = noise.GetOpenSimplex2SWithHessian(point[0], point[1], point[2]);
+                const auto gradient = noise.GetOpenSimplex2SWithGradient(point[0], point[1], point[2]);
+                require(sample.value == gradient.value && sample.dx == gradient.dx
+                    && sample.dy == gradient.dy && sample.dz == gradient.dz,
+                    "Hessian API changed value or gradient");
+                const float step = 0.001f;
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 3; ++column)
+                    {
+                        require(std::abs(sample.hessian[row][column] - sample.hessian[column][row]) < 2e-6f,
+                            "analytic Hessian is not symmetric");
+                        double plus[3] = {point[0], point[1], point[2]};
+                        double minus[3] = {point[0], point[1], point[2]};
+                        plus[column] += step;
+                        minus[column] -= step;
+                        const auto plus_gradient = noise.GetOpenSimplex2SWithGradient(plus[0], plus[1], plus[2]);
+                        const auto minus_gradient = noise.GetOpenSimplex2SWithGradient(minus[0], minus[1], minus[2]);
+                        const float plus_values[] = {plus_gradient.dx, plus_gradient.dy, plus_gradient.dz};
+                        const float minus_values[] = {minus_gradient.dx, minus_gradient.dy, minus_gradient.dz};
+                        const float finite_difference = (plus_values[row] - minus_values[row]) / (2 * step);
+                        require(std::abs(sample.hessian[row][column] - finite_difference) < 0.01f,
+                            "analytic Hessian disagrees with gradient difference");
+                    }
+                ++hessian_checked;
+            }
+        }
         // Transport the known old source seam into every orientation, rather
         // than treating its old world coordinates as source coordinates.
         const double old_point[3] = {-1.02741, -1.75862226094, 0.533843};
@@ -182,6 +219,16 @@ int main()
                     const auto center = seam.GetOpenSimplex2SWithGradient(p[0], p[1], p[2]);
                     const auto lo = seam.GetOpenSimplex2SWithGradient(before[0], before[1], before[2]);
                     const auto hi = seam.GetOpenSimplex2SWithGradient(after[0], after[1], after[2]);
+                    const auto center_hessian = seam.GetOpenSimplex2SWithHessian(p[0], p[1], p[2]);
+                    const auto before_hessian = seam.GetOpenSimplex2SWithHessian(before[0], before[1], before[2]);
+                    const auto after_hessian = seam.GetOpenSimplex2SWithHessian(after[0], after[1], after[2]);
+                    for (int row = 0; row < 3; ++row)
+                        for (int column = 0; column < 3; ++column)
+                            require(std::abs(center_hessian.hessian[row][column]
+                                    - before_hessian.hessian[row][column]) < 0.01f
+                                && std::abs(center_hessian.hessian[row][column]
+                                    - after_hessian.hessian[row][column]) < 0.01f,
+                                "former seam Hessian is discontinuous");
                     require(std::abs(hi.value - lo.value) < 2e-5, "former seam scalar is discontinuous");
                     for (auto neighbor : {lo, hi})
                         require(std::abs(neighbor.dx - center.dx) < 0.0015
@@ -219,7 +266,8 @@ int main()
             ++oracle_checked;
         }
         std::cout << "Checked " << checked << " float/double samples, " << seam_checked
-                  << " former-seam fixtures, and " << oracle_checked
+                  << " former-seam fixtures, " << hessian_checked
+                  << " Hessian fixtures, and " << oracle_checked
                   << " independent complete-support points; fused/value-only values exact; maximum derivative error "
                   << maximum_error << '\n';
     }
