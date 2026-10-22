@@ -55,6 +55,14 @@
 class FastNoiseLite
 {
 public:
+    struct NoiseGradient3D
+    {
+        float value;
+        float dx;
+        float dy;
+        float dz;
+    };
+
     enum NoiseType
     {
         NoiseType_OpenSimplex2,
@@ -338,6 +346,51 @@ public:
         }
     }
 
+    /// Raw 3D OpenSimplex2S value and analytic Cartesian gradient.
+    /// Uses seed, frequency and RotationType3D; ignores noise/fractal type.
+    /// Derivatives are with respect to the original input coordinates.
+    /// Returns derivatives of the selected polynomial branch. Scalar behavior
+    /// includes inherited traversal discontinuities, where no derivative exists.
+    template <typename FNfloat>
+    NoiseGradient3D GetOpenSimplex2SWithGradient(FNfloat x, FNfloat y, FNfloat z) const
+    {
+        Arguments_must_be_floating_point_values<FNfloat>();
+        TransformType3D transform = TransformType3D_DefaultOpenSimplex2;
+        if (mRotationType3D == RotationType3D_ImproveXYPlanes)
+            transform = TransformType3D_ImproveXYPlanes;
+        else if (mRotationType3D == RotationType3D_ImproveXZPlanes)
+            transform = TransformType3D_ImproveXZPlanes;
+        TransformNoiseCoordinate(x, y, z, transform);
+
+        NoiseGradient3D result = {0, 0, 0, 0};
+        result.value = SingleOpenSimplex2S<true>(mSeed, x, y, z, &result);
+        const FNfloat gx = result.dx, gy = result.dy, gz = result.dz;
+        const FNfloat a = (FNfloat)-0.211324865405187;
+        const FNfloat b = (FNfloat)0.577350269189626;
+        if (transform == TransformType3D_ImproveXYPlanes)
+        {
+            FNfloat s = a * (gx + gy) + b * gz;
+            result.dx = (float)((gx + s) * mFrequency);
+            result.dy = (float)((gy + s) * mFrequency);
+            result.dz = (float)(b * (gz - gx - gy) * mFrequency);
+        }
+        else if (transform == TransformType3D_ImproveXZPlanes)
+        {
+            FNfloat s = a * (gx + gz) + b * gy;
+            result.dx = (float)((gx + s) * mFrequency);
+            result.dy = (float)(b * (gy - gx - gz) * mFrequency);
+            result.dz = (float)((gz + s) * mFrequency);
+        }
+        else
+        {
+            FNfloat r = (gx + gy + gz) * (FNfloat)(2.0 / 3.0);
+            result.dx = (float)((r - gx) * mFrequency);
+            result.dy = (float)((r - gy) * mFrequency);
+            result.dz = (float)((r - gz) * mFrequency);
+        }
+        return result;
+    }
+
 
     /// <summary>
     /// 2D warps the input position using current domain warp settings
@@ -541,6 +594,13 @@ private:
 
     float GradCoord(int seed, int xPrimed, int yPrimed, int zPrimed, float xd, float yd, float zd) const
     {
+        return GradCoordWithDerivative<false>(seed, xPrimed, yPrimed, zPrimed, xd, yd, zd, 0, nullptr);
+    }
+
+    template <bool Derivatives>
+    float GradCoordWithDerivative(int seed, int xPrimed, int yPrimed, int zPrimed,
+        float xd, float yd, float zd, float a, NoiseGradient3D* gradient) const
+    {
         int hash = Hash(seed, xPrimed, yPrimed, zPrimed);
         hash ^= hash >> 15;
         hash &= 63 << 2;
@@ -548,8 +608,18 @@ private:
         float xg = Lookup<float>::Gradients3D[hash];
         float yg = Lookup<float>::Gradients3D[hash | 1];
         float zg = Lookup<float>::Gradients3D[hash | 2];
-
-        return xd * xg + yd * yg + zd * zg;
+        float dot = xd * xg + yd * yg + zd * zg;
+        if (Derivatives)
+        {
+            // d(a^4 * dot(g,d))/dd = a^4*g - 8*a^3*dot(g,d)*d.
+            float aa = a * a;
+            float aaaa = aa * aa;
+            float radial = -8.0f * aa * a * dot;
+            gradient->dx += aaaa * xg + radial * xd;
+            gradient->dy += aaaa * yg + radial * yd;
+            gradient->dz += aaaa * zg + radial * zd;
+        }
+        return dot;
     }
 
 
@@ -686,11 +756,17 @@ private:
     template <typename FNfloat>
     void TransformNoiseCoordinate(FNfloat& x, FNfloat& y, FNfloat& z) const
     {
+        TransformNoiseCoordinate(x, y, z, mTransformType3D);
+    }
+
+    template <typename FNfloat>
+    void TransformNoiseCoordinate(FNfloat& x, FNfloat& y, FNfloat& z, TransformType3D transform) const
+    {
         x *= mFrequency;
         y *= mFrequency;
         z *= mFrequency;
 
-        switch (mTransformType3D)
+        switch (transform)
         {
         case TransformType3D_ImproveXYPlanes:
             {
@@ -1283,8 +1359,8 @@ private:
         return value * 18.24196194486065f;
     }
 
-    template <typename FNfloat>
-    float SingleOpenSimplex2S(int seed, FNfloat x, FNfloat y, FNfloat z) const
+    template <bool Derivatives = false, typename FNfloat>
+    float SingleOpenSimplex2S(int seed, FNfloat x, FNfloat y, FNfloat z, NoiseGradient3D* gradient = nullptr) const
     {
         // 3D OpenSimplex2S case uses two offset rotated cube grids.
 
@@ -1315,15 +1391,15 @@ private:
         float y0 = yi + yNMask;
         float z0 = zi + zNMask;
         float a0 = 0.75f - x0 * x0 - y0 * y0 - z0 * z0;
-        float value = (a0 * a0) * (a0 * a0) * GradCoord(seed,
-                                                        i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x0, y0, z0);
+        float value = (a0 * a0) * (a0 * a0) * GradCoordWithDerivative<Derivatives>(seed,
+            i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x0, y0, z0, a0, gradient);
 
         float x1 = xi - 0.5f;
         float y1 = yi - 0.5f;
         float z1 = zi - 0.5f;
         float a1 = 0.75f - x1 * x1 - y1 * y1 - z1 * z1;
-        value += (a1 * a1) * (a1 * a1) * GradCoord(seed2,
-                                                   i + PrimeX, j + PrimeY, k + PrimeZ, x1, y1, z1);
+        value += (a1 * a1) * (a1 * a1) * GradCoordWithDerivative<Derivatives>(seed2,
+            i + PrimeX, j + PrimeY, k + PrimeZ, x1, y1, z1, a1, gradient);
 
         float xAFlipMask0 = ((xNMask | 1) << 1) * x1;
         float yAFlipMask0 = ((yNMask | 1) << 1) * y1;
@@ -1339,8 +1415,8 @@ private:
             float x2 = x0 - (xNMask | 1);
             float y2 = y0;
             float z2 = z0;
-            value += (a2 * a2) * (a2 * a2) * GradCoord(seed,
-                                                       i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x2, y2, z2);
+            value += (a2 * a2) * (a2 * a2) * GradCoordWithDerivative<Derivatives>(seed,
+                i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x2, y2, z2, a2, gradient);
         }
         else
         {
@@ -1350,8 +1426,8 @@ private:
                 float x3 = x0;
                 float y3 = y0 - (yNMask | 1);
                 float z3 = z0 - (zNMask | 1);
-                value += (a3 * a3) * (a3 * a3) * GradCoord(seed,
-                                                           i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (~zNMask & PrimeZ), x3, y3, z3);
+                value += (a3 * a3) * (a3 * a3) * GradCoordWithDerivative<Derivatives>(seed,
+                    i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (~zNMask & PrimeZ), x3, y3, z3, a3, gradient);
             }
 
             float a4 = xAFlipMask1 + a1;
@@ -1360,8 +1436,8 @@ private:
                 float x4 = (xNMask | 1) + x1;
                 float y4 = y1;
                 float z4 = z1;
-                value += (a4 * a4) * (a4 * a4) * GradCoord(seed2,
-                                                           i + (xNMask & (PrimeX * 2)), j + PrimeY, k + PrimeZ, x4, y4, z4);
+                value += (a4 * a4) * (a4 * a4) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + (xNMask & (PrimeX * 2)), j + PrimeY, k + PrimeZ, x4, y4, z4, a4, gradient);
                 skip5 = true;
             }
         }
@@ -1373,8 +1449,8 @@ private:
             float x6 = x0;
             float y6 = y0 - (yNMask | 1);
             float z6 = z0;
-            value += (a6 * a6) * (a6 * a6) * GradCoord(seed,
-                                                       i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), x6, y6, z6);
+            value += (a6 * a6) * (a6 * a6) * GradCoordWithDerivative<Derivatives>(seed,
+                i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), x6, y6, z6, a6, gradient);
         }
         else
         {
@@ -1384,8 +1460,8 @@ private:
                 float x7 = x0 - (xNMask | 1);
                 float y7 = y0;
                 float z7 = z0 - (zNMask | 1);
-                value += (a7 * a7) * (a7 * a7) * GradCoord(seed,
-                                                           i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), x7, y7, z7);
+                value += (a7 * a7) * (a7 * a7) * GradCoordWithDerivative<Derivatives>(seed,
+                    i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), x7, y7, z7, a7, gradient);
             }
 
             float a8 = yAFlipMask1 + a1;
@@ -1394,8 +1470,8 @@ private:
                 float x8 = x1;
                 float y8 = (yNMask | 1) + y1;
                 float z8 = z1;
-                value += (a8 * a8) * (a8 * a8) * GradCoord(seed2,
-                                                           i + PrimeX, j + (yNMask & (PrimeY << 1)), k + PrimeZ, x8, y8, z8);
+                value += (a8 * a8) * (a8 * a8) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + PrimeX, j + (yNMask & (PrimeY << 1)), k + PrimeZ, x8, y8, z8, a8, gradient);
                 skip9 = true;
             }
         }
@@ -1407,8 +1483,8 @@ private:
             float xA = x0;
             float yA = y0;
             float zA = z0 - (zNMask | 1);
-            value += (aA * aA) * (aA * aA) * GradCoord(seed,
-                                                       i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), xA, yA, zA);
+            value += (aA * aA) * (aA * aA) * GradCoordWithDerivative<Derivatives>(seed,
+                i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), xA, yA, zA, aA, gradient);
         }
         else
         {
@@ -1418,8 +1494,8 @@ private:
                 float xB = x0 - (xNMask | 1);
                 float yB = y0 - (yNMask | 1);
                 float zB = z0;
-                value += (aB * aB) * (aB * aB) * GradCoord(seed,
-                                                           i + (~xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), xB, yB, zB);
+                value += (aB * aB) * (aB * aB) * GradCoordWithDerivative<Derivatives>(seed,
+                    i + (~xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), xB, yB, zB, aB, gradient);
             }
 
             float aC = zAFlipMask1 + a1;
@@ -1428,8 +1504,8 @@ private:
                 float xC = x1;
                 float yC = y1;
                 float zC = (zNMask | 1) + z1;
-                value += (aC * aC) * (aC * aC) * GradCoord(seed2,
-                                                           i + PrimeX, j + PrimeY, k + (zNMask & (PrimeZ << 1)), xC, yC, zC);
+                value += (aC * aC) * (aC * aC) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + PrimeX, j + PrimeY, k + (zNMask & (PrimeZ << 1)), xC, yC, zC, aC, gradient);
                 skipD = true;
             }
         }
@@ -1442,8 +1518,8 @@ private:
                 float x5 = x1;
                 float y5 = (yNMask | 1) + y1;
                 float z5 = (zNMask | 1) + z1;
-                value += (a5 * a5) * (a5 * a5) * GradCoord(seed2,
-                                                           i + PrimeX, j + (yNMask & (PrimeY << 1)), k + (zNMask & (PrimeZ << 1)), x5, y5, z5);
+                value += (a5 * a5) * (a5 * a5) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + PrimeX, j + (yNMask & (PrimeY << 1)), k + (zNMask & (PrimeZ << 1)), x5, y5, z5, a5, gradient);
             }
         }
 
@@ -1455,8 +1531,8 @@ private:
                 float x9 = (xNMask | 1) + x1;
                 float y9 = y1;
                 float z9 = (zNMask | 1) + z1;
-                value += (a9 * a9) * (a9 * a9) * GradCoord(seed2,
-                                                           i + (xNMask & (PrimeX * 2)), j + PrimeY, k + (zNMask & (PrimeZ << 1)), x9, y9, z9);
+                value += (a9 * a9) * (a9 * a9) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + (xNMask & (PrimeX * 2)), j + PrimeY, k + (zNMask & (PrimeZ << 1)), x9, y9, z9, a9, gradient);
             }
         }
 
@@ -1468,11 +1544,17 @@ private:
                 float xD = (xNMask | 1) + x1;
                 float yD = (yNMask | 1) + y1;
                 float zD = z1;
-                value += (aD * aD) * (aD * aD) * GradCoord(seed2,
-                                                           i + (xNMask & (PrimeX << 1)), j + (yNMask & (PrimeY << 1)), k + PrimeZ, xD, yD, zD);
+                value += (aD * aD) * (aD * aD) * GradCoordWithDerivative<Derivatives>(seed2,
+                    i + (xNMask & (PrimeX << 1)), j + (yNMask & (PrimeY << 1)), k + PrimeZ, xD, yD, zD, aD, gradient);
             }
         }
 
+        if (Derivatives)
+        {
+            gradient->dx *= 9.046026385208288f;
+            gradient->dy *= 9.046026385208288f;
+            gradient->dz *= 9.046026385208288f;
+        }
         return value * 9.046026385208288f;
     }
 
