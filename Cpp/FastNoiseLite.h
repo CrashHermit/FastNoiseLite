@@ -349,8 +349,8 @@ public:
     /// Raw 3D OpenSimplex2S value and analytic Cartesian gradient.
     /// Uses seed, frequency and RotationType3D; ignores noise/fractal type.
     /// Derivatives are with respect to the original input coordinates.
-    /// Returns derivatives of the selected polynomial branch. Scalar behavior
-    /// includes inherited traversal discontinuities, where no derivative exists.
+    /// Complete compact-support contributions join continuously with their
+    /// derivatives in real arithmetic; floating-point quantization is unchanged.
     template <typename FNfloat>
     NoiseGradient3D GetOpenSimplex2SWithGradient(FNfloat x, FNfloat y, FNfloat z) const
     {
@@ -1362,200 +1362,74 @@ private:
     template <bool Derivatives = false, typename FNfloat>
     float SingleOpenSimplex2S(int seed, FNfloat x, FNfloat y, FNfloat z, NoiseGradient3D* gradient = nullptr) const
     {
-        // 3D OpenSimplex2S case uses two offset rotated cube grids.
-
-        /*
-         * --- Rotation moved to TransformNoiseCoordinate method ---
-         * const FNfloat R3 = (FNfloat)(2.0 / 3.0);
-         * FNfloat r = (x + y + z) * R3; // Rotation, not skew
-         * x = r - x; y = r - y; z = r - z;
-        */
-
         int i = FastFloor(x);
         int j = FastFloor(y);
         int k = FastFloor(z);
         float xi = (float)(x - i);
         float yi = (float)(y - j);
         float zi = (float)(z - k);
-
         i *= PrimeX;
         j *= PrimeY;
         k *= PrimeZ;
-        int seed2 = seed + 1293373;
 
-        int xNMask = (int)(-0.5f - xi);
-        int yNMask = (int)(-0.5f - yi);
-        int zNMask = (int)(-0.5f - zi);
-
-        float x0 = xi + xNMask;
-        float y0 = yi + yNMask;
-        float z0 = zi + zNMask;
-        float a0 = 0.75f - x0 * x0 - y0 * y0 - z0 * z0;
-        float value = (a0 * a0) * (a0 * a0) * GradCoordWithDerivative<Derivatives>(seed,
-            i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x0, y0, z0, a0, gradient);
-
-        float x1 = xi - 0.5f;
-        float y1 = yi - 0.5f;
-        float z1 = zi - 0.5f;
-        float a1 = 0.75f - x1 * x1 - y1 * y1 - z1 * z1;
-        value += (a1 * a1) * (a1 * a1) * GradCoordWithDerivative<Derivatives>(seed2,
-            i + PrimeX, j + PrimeY, k + PrimeZ, x1, y1, z1, a1, gradient);
-
-        float xAFlipMask0 = ((xNMask | 1) << 1) * x1;
-        float yAFlipMask0 = ((yNMask | 1) << 1) * y1;
-        float zAFlipMask0 = ((zNMask | 1) << 1) * z1;
-        float xAFlipMask1 = (-2 - (xNMask << 2)) * x1 - 1.0f;
-        float yAFlipMask1 = (-2 - (yNMask << 2)) * y1 - 1.0f;
-        float zAFlipMask1 = (-2 - (zNMask << 2)) * z1 - 1.0f;
-
-        bool skip5 = false;
-        float a2 = xAFlipMask0 + a0;
-        if (a2 > 0)
+        float value = 0;
+        for (int lattice = 0; lattice < 2; ++lattice)
         {
-            float x2 = x0 - (xNMask | 1);
-            float y2 = y0;
-            float z2 = z0;
-            value += (a2 * a2) * (a2 * a2) * GradCoordWithDerivative<Derivatives>(seed,
-                i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (zNMask & PrimeZ), x2, y2, z2, a2, gradient);
-        }
-        else
-        {
-            float a3 = yAFlipMask0 + zAFlipMask0 + a0;
-            if (a3 > 0)
+            float cx = xi - 0.5f;
+            float cy = yi - 0.5f;
+            float cz = zi - 0.5f;
+            float sum = cx + cy + cz;
+
+            // Radius sqrt(3)/2 is less than one: only the enclosing cube's
+            // vertices can contribute. Opposite vertices are sqrt(3) apart,
+            // so at most one member of each pair has positive support.
+            // At a pair's selection plane both contributions are zero.
+            for (int pair = 0; pair < 4; ++pair)
             {
-                float x3 = x0;
-                float y3 = y0 - (yNMask | 1);
-                float z3 = z0 - (zNMask | 1);
-                value += (a3 * a3) * (a3 * a3) * GradCoordWithDerivative<Derivatives>(seed,
-                    i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (~zNMask & PrimeZ), x3, y3, z3, a3, gradient);
+                int vx = pair == 1;
+                int vy = pair == 2;
+                int vz = pair == 3;
+                float score = pair == 0 ? sum :
+                    pair == 1 ? sum - 2 * cx :
+                    pair == 2 ? sum - 2 * cy : sum - 2 * cz;
+                int flip = score > 0;
+                vx ^= flip;
+                vy ^= flip;
+                vz ^= flip;
+                float xd = xi - vx;
+                float yd = yi - vy;
+                float zd = zi - vz;
+                float a = 0.75f - xd * xd - yd * yd - zd * zd;
+                if (a > 0)
+                {
+                    value += (a * a) * (a * a) * GradCoordWithDerivative<Derivatives>(
+                        seed, i + vx * PrimeX, j + vy * PrimeY, k + vz * PrimeZ,
+                        xd, yd, zd, a, gradient);
+                }
             }
 
-            float a4 = xAFlipMask1 + a1;
-            if (a4 > 0)
+            if (lattice == 0)
             {
-                float x4 = (xNMask | 1) + x1;
-                float y4 = y1;
-                float z4 = z1;
-                value += (a4 * a4) * (a4 * a4) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + (xNMask & (PrimeX * 2)), j + PrimeY, k + PrimeZ, x4, y4, z4, a4, gradient);
-                skip5 = true;
+                // The second grid samples p + .5 and hashes its integer
+                // vertices, preserving the original half-grid seed/index map.
+                xi += 0.5f;
+                yi += 0.5f;
+                zi += 0.5f;
+                if (xi >= 1) { xi -= 1; i += PrimeX; }
+                if (yi >= 1) { yi -= 1; j += PrimeY; }
+                if (zi >= 1) { zi -= 1; k += PrimeZ; }
+                seed += 1293373;
             }
         }
 
-        bool skip9 = false;
-        float a6 = yAFlipMask0 + a0;
-        if (a6 > 0)
-        {
-            float x6 = x0;
-            float y6 = y0 - (yNMask | 1);
-            float z6 = z0;
-            value += (a6 * a6) * (a6 * a6) * GradCoordWithDerivative<Derivatives>(seed,
-                i + (xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), x6, y6, z6, a6, gradient);
-        }
-        else
-        {
-            float a7 = xAFlipMask0 + zAFlipMask0 + a0;
-            if (a7 > 0)
-            {
-                float x7 = x0 - (xNMask | 1);
-                float y7 = y0;
-                float z7 = z0 - (zNMask | 1);
-                value += (a7 * a7) * (a7 * a7) * GradCoordWithDerivative<Derivatives>(seed,
-                    i + (~xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), x7, y7, z7, a7, gradient);
-            }
-
-            float a8 = yAFlipMask1 + a1;
-            if (a8 > 0)
-            {
-                float x8 = x1;
-                float y8 = (yNMask | 1) + y1;
-                float z8 = z1;
-                value += (a8 * a8) * (a8 * a8) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + PrimeX, j + (yNMask & (PrimeY << 1)), k + PrimeZ, x8, y8, z8, a8, gradient);
-                skip9 = true;
-            }
-        }
-
-        bool skipD = false;
-        float aA = zAFlipMask0 + a0;
-        if (aA > 0)
-        {
-            float xA = x0;
-            float yA = y0;
-            float zA = z0 - (zNMask | 1);
-            value += (aA * aA) * (aA * aA) * GradCoordWithDerivative<Derivatives>(seed,
-                i + (xNMask & PrimeX), j + (yNMask & PrimeY), k + (~zNMask & PrimeZ), xA, yA, zA, aA, gradient);
-        }
-        else
-        {
-            float aB = xAFlipMask0 + yAFlipMask0 + a0;
-            if (aB > 0)
-            {
-                float xB = x0 - (xNMask | 1);
-                float yB = y0 - (yNMask | 1);
-                float zB = z0;
-                value += (aB * aB) * (aB * aB) * GradCoordWithDerivative<Derivatives>(seed,
-                    i + (~xNMask & PrimeX), j + (~yNMask & PrimeY), k + (zNMask & PrimeZ), xB, yB, zB, aB, gradient);
-            }
-
-            float aC = zAFlipMask1 + a1;
-            if (aC > 0)
-            {
-                float xC = x1;
-                float yC = y1;
-                float zC = (zNMask | 1) + z1;
-                value += (aC * aC) * (aC * aC) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + PrimeX, j + PrimeY, k + (zNMask & (PrimeZ << 1)), xC, yC, zC, aC, gradient);
-                skipD = true;
-            }
-        }
-
-        if (!skip5)
-        {
-            float a5 = yAFlipMask1 + zAFlipMask1 + a1;
-            if (a5 > 0)
-            {
-                float x5 = x1;
-                float y5 = (yNMask | 1) + y1;
-                float z5 = (zNMask | 1) + z1;
-                value += (a5 * a5) * (a5 * a5) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + PrimeX, j + (yNMask & (PrimeY << 1)), k + (zNMask & (PrimeZ << 1)), x5, y5, z5, a5, gradient);
-            }
-        }
-
-        if (!skip9)
-        {
-            float a9 = xAFlipMask1 + zAFlipMask1 + a1;
-            if (a9 > 0)
-            {
-                float x9 = (xNMask | 1) + x1;
-                float y9 = y1;
-                float z9 = (zNMask | 1) + z1;
-                value += (a9 * a9) * (a9 * a9) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + (xNMask & (PrimeX * 2)), j + PrimeY, k + (zNMask & (PrimeZ << 1)), x9, y9, z9, a9, gradient);
-            }
-        }
-
-        if (!skipD)
-        {
-            float aD = xAFlipMask1 + yAFlipMask1 + a1;
-            if (aD > 0)
-            {
-                float xD = (xNMask | 1) + x1;
-                float yD = (yNMask | 1) + y1;
-                float zD = z1;
-                value += (aD * aD) * (aD * aD) * GradCoordWithDerivative<Derivatives>(seed2,
-                    i + (xNMask & (PrimeX << 1)), j + (yNMask & (PrimeY << 1)), k + PrimeZ, xD, yD, zD, aD, gradient);
-            }
-        }
-
+        const float normalization = 9.046026385208288f;
         if (Derivatives)
         {
-            gradient->dx *= 9.046026385208288f;
-            gradient->dy *= 9.046026385208288f;
-            gradient->dz *= 9.046026385208288f;
+            gradient->dx *= normalization;
+            gradient->dy *= normalization;
+            gradient->dz *= normalization;
         }
-        return value * 9.046026385208288f;
+        return value * normalization;
     }
 
 

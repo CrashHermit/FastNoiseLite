@@ -35,7 +35,7 @@ static float check_point(FastNoiseLite& noise, Coordinate x, Coordinate y, Coord
         const float error = std::abs(numerical - gradient[axis]);
         maximum_error = std::max(maximum_error, error);
         require(error < 0.0025f * std::abs(frequency) + 0.0002f,
-            "analytic gradient disagrees with branch-local numerical derivative");
+            "analytic gradient disagrees with numerical derivative");
     }
     return maximum_error;
 }
@@ -43,8 +43,8 @@ static float check_point(FastNoiseLite& noise, Coordinate x, Coordinate y, Coord
 static void source_to_world(const double* q, double* p,
     FastNoiseLite::RotationType3D rotation, float frequency)
 {
-    // Invert the orthonormal orientation only to place fixtures away from
-    // scalar branch switches. Numerical differentiation still uses GetNoise.
+    // Invert the sampler's orthonormal orientation to construct source-space
+    // fixtures; derivatives are still checked through the public API.
     const double a = -0.211324865405187, b = 0.577350269189626;
     const double xy[3][3] = {{1+a,a,b},{a,1+a,b},{-b,-b,b}};
     const double xz[3][3] = {{1+a,b,a},{-b,b,-b},{a,b,1+a}};
@@ -61,12 +61,55 @@ static void source_to_world(const double* q, double* p,
     }
 }
 
+static const double GradientScale = 0.75 * 0.75 * 0.75 * 0.75 * 9.046026385208288;
+
+static double dot3(const double* a, const double* b)
+{
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+static void source_gradient(const FastNoiseLite::NoiseGradient3D& sample, double* g)
+{
+    // The oracle uses frequency one and the symmetric default orientation.
+    const double r = (sample.dx + sample.dy + sample.dz) * (2.0 / 3.0);
+    g[0] = (r - sample.dx) / GradientScale;
+    g[1] = (r - sample.dy) / GradientScale;
+    g[2] = (r - sample.dz) / GradientScale;
+}
+
+static float complete_support_value(const double* q, int seed)
+{
+    FastNoiseLite nodes(seed);
+    nodes.SetFrequency(1.0f);
+    double sum=0;
+    for (int lattice=0;lattice<2;++lattice) {
+        const double offset=lattice ? 0.5 : 0.0;
+        const int base[3] = {(int)std::floor(q[0]+offset),(int)std::floor(q[1]+offset),(int)std::floor(q[2]+offset)};
+        for (int x=0;x<2;++x) for (int y=0;y<2;++y) for (int z=0;z<2;++z) {
+            const double node[3] = {base[0]+x-offset,base[1]+y-offset,base[2]+z-offset};
+            const double d[3] = {q[0]-node[0],q[1]-node[1],q[2]-node[2]};
+            const double attenuation=0.75-dot3(d,d);
+            if (attenuation<=0) continue;
+            double world_node[3];
+            source_to_world(node, world_node, FastNoiseLite::RotationType3D_None, 1);
+            const auto sample = nodes.GetOpenSimplex2SWithGradient(
+                world_node[0], world_node[1], world_node[2]);
+            double g[3];
+            source_gradient(sample, g);
+            require(std::abs(dot3(g,g)-2.0)<0.0002,"recovered nodal gradient has unexpected norm");
+            sum += 9.046026385208288*attenuation*attenuation*attenuation*attenuation*dot3(g,d);
+        }
+    }
+    return (float)sum;
+}
+
 int main()
 {
     try
     {
         float maximum_error = 0;
         int checked = 0;
+        int oracle_checked = 0;
         for (int seed : {-1337, 0, 123, 2026})
         {
             FastNoiseLite noise(seed);
@@ -84,12 +127,6 @@ int main()
                     for (int j = 0; j < 4; ++j)
                     for (int k = 0; k < 4; ++k)
                     {
-                        // Odd eighths stay at least 1/8 from lattice/mask
-                        // planes. Squared distances to either lattice have an
-                        // odd numerator over64, never the support cutoff48/64.
-                        // Thus the .001 lattice-space stencil stays inside
-                        // one polynomial branch, without selecting fixtures
-                        // based on the derivative being tested.
                         const double q[] = {(2*i+1)/8.0-1, (2*j+1)/8.0, (2*k+1)/8.0+1};
                         double p[3];
                         source_to_world(q, p, rotation, frequency);
@@ -111,15 +148,79 @@ int main()
                 }
             }
         }
-        // Both sides of the inherited a2/a4 selection seam near y=-1.758622.
-        // No classical derivative is claimed at the discontinuity itself.
-        FastNoiseLite seam(-1337);
-        seam.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2S);
-        seam.SetFrequency(0.37f);
-        for (double y : {-1.76086, -1.75686})
-            maximum_error = std::max(maximum_error,
-                check_point(seam, -1.02741, y, 0.533843, 0.37f, 0.000037));
-        std::cout << "Checked " << checked + 2 << " branch-interior float/double samples; scalar values exact; maximum derivative error "
+        // Transport the known old source seam into every orientation, rather
+        // than treating its old world coordinates as source coordinates.
+        const double old_point[3] = {-1.02741, -1.75862226094, 0.533843};
+        double seam_source[3];
+        source_to_world(old_point, seam_source, FastNoiseLite::RotationType3D_None, 1);
+        for (int axis = 0; axis < 3; ++axis) seam_source[axis] *= 0.37f;
+        const double seam_step[3] = {2.0/3 * 0.37f, -1.0/3 * 0.37f, 2.0/3 * 0.37f};
+        int seam_checked = 0;
+        for (int seed : {-1337, 0, 123, 2026})
+        {
+            FastNoiseLite seam(seed);
+            seam.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2S);
+            seam.SetFrequency(0.37f);
+            for (auto rotation : {FastNoiseLite::RotationType3D_None,
+                FastNoiseLite::RotationType3D_ImproveXYPlanes,
+                FastNoiseLite::RotationType3D_ImproveXZPlanes})
+            {
+                seam.SetRotationType3D(rotation);
+                for (int permutation = 0; permutation < 3; ++permutation)
+                {
+                    double q[3], lower[3], upper[3], p[3], before[3], after[3];
+                    for (int axis = 0; axis < 3; ++axis)
+                    {
+                        const int index = (axis + permutation) % 3;
+                        q[axis] = seam_source[index];
+                        lower[axis] = q[axis] - 1e-6 * seam_step[index];
+                        upper[axis] = q[axis] + 1e-6 * seam_step[index];
+                    }
+                    source_to_world(q, p, rotation, 0.37f);
+                    source_to_world(lower, before, rotation, 0.37f);
+                    source_to_world(upper, after, rotation, 0.37f);
+                    const auto center = seam.GetOpenSimplex2SWithGradient(p[0], p[1], p[2]);
+                    const auto lo = seam.GetOpenSimplex2SWithGradient(before[0], before[1], before[2]);
+                    const auto hi = seam.GetOpenSimplex2SWithGradient(after[0], after[1], after[2]);
+                    require(std::abs(hi.value - lo.value) < 2e-5, "former seam scalar is discontinuous");
+                    for (auto neighbor : {lo, hi})
+                        require(std::abs(neighbor.dx - center.dx) < 0.0015
+                            && std::abs(neighbor.dy - center.dy) < 0.0015
+                            && std::abs(neighbor.dz - center.dz) < 0.0015,
+                            "former seam gradient is discontinuous");
+                    for (const double* point : {before, p, after})
+                        maximum_error = std::max(maximum_error,
+                            check_point(seam, point[0], point[1], point[2], 0.37f));
+                    ++seam_checked;
+                }
+            }
+        }
+        FastNoiseLite oracle(1337);
+        oracle.SetNoiseType(FastNoiseLite::NoiseType_OpenSimplex2S);
+        oracle.SetRotationType3D(FastNoiseLite::RotationType3D_None);
+        oracle.SetFrequency(1.0f);
+        for (int i=0;i<160;++i) {
+            double q[3] = {std::sin(i*1.31)*4.7, std::cos(i*0.73)*3.9-2.0, std::sin(i*0.37)*5.1};
+            if (i%4==0) q[i%3]=std::floor(q[i%3])+0.5;
+            if (i%4==1) q[i%3]=std::floor(q[i%3]);
+            double p[3]; source_to_world(q,p,FastNoiseLite::RotationType3D_None,1);
+            const float actual=oracle.GetNoise(p[0],p[1],p[2]);
+            const float expected=complete_support_value(q,1337);
+            require(std::abs(actual-expected)<5e-6f,"public scalar disagrees with complete 16-vertex support oracle");
+            ++oracle_checked;
+        }
+        for (double transition : {0.0, 0.5, std::sqrt(0.75)-1e-7,
+            std::sqrt(0.75), std::sqrt(0.75)+1e-7}) {
+            const double q[3]={transition,0.0,0.0};
+            double p[3]; source_to_world(q,p,FastNoiseLite::RotationType3D_None,1);
+            const float actual=oracle.GetNoise(p[0],p[1],p[2]);
+            const float expected=complete_support_value(q,1337);
+            require(std::abs(actual-expected)<5e-6f,"support/tie fixture disagrees with complete support oracle");
+            ++oracle_checked;
+        }
+        std::cout << "Checked " << checked << " float/double samples, " << seam_checked
+                  << " former-seam fixtures, and " << oracle_checked
+                  << " independent complete-support points; fused/value-only values exact; maximum derivative error "
                   << maximum_error << '\n';
     }
     catch (const std::exception& error)
