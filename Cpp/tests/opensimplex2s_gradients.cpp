@@ -185,6 +185,107 @@ int main()
                 ++hessian_checked;
             }
         }
+        int third_checked = 0;
+        for (auto rotation : {FastNoiseLite::RotationType3D_None,
+            FastNoiseLite::RotationType3D_ImproveXYPlanes,
+            FastNoiseLite::RotationType3D_ImproveXZPlanes})
+        {
+            FastNoiseLite noise(2718);
+            noise.SetRotationType3D(rotation);
+            for (float frequency : {0.37f, -0.61f, 1.0f})
+            {
+                noise.SetFrequency(frequency);
+                const double points[3][3] = {
+                    {0.137, -0.281, 0.419}, {-1.73, 2.11, -0.97}, {0.667, -0.37, 0.27}};
+                for (int point_index = 0; point_index < 3; ++point_index)
+                {
+                    const double* point = points[point_index];
+                    const auto third = noise.GetOpenSimplex2SWithThirdDerivatives(point[0], point[1], point[2]);
+                    const auto hessian = noise.GetOpenSimplex2SWithHessian(point[0], point[1], point[2]);
+                    const auto gradient = noise.GetOpenSimplex2SWithGradient(point[0], point[1], point[2]);
+                    require(third.value == hessian.value && third.value == gradient.value
+                        && third.dx == hessian.dx && third.dx == gradient.dx
+                        && third.dy == hessian.dy && third.dy == gradient.dy
+                        && third.dz == hessian.dz && third.dz == gradient.dz,
+                        "third derivative API changed value or gradient");
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j)
+                        {
+                            require(third.hessian[i][j] == hessian.hessian[i][j],
+                                "third derivative API changed Hessian");
+                            for (int k = 0; k < 3; ++k)
+                                require(std::abs(third.third[i][j][k] - third.third[i][k][j]) < 2e-5f
+                                    && std::abs(third.third[i][j][k] - third.third[j][i][k]) < 2e-5f,
+                                    "analytic third derivative tensor is not symmetric");
+                        }
+                    const double step = 0.01;
+                    for (int axis = 0; axis < 3; ++axis)
+                    {
+                        double plus[3] = {point[0], point[1], point[2]};
+                        double minus[3] = {point[0], point[1], point[2]};
+                        plus[axis] += step;
+                        minus[axis] -= step;
+                        const auto hp = noise.GetOpenSimplex2SWithHessian(plus[0], plus[1], plus[2]);
+                        const auto hm = noise.GetOpenSimplex2SWithHessian(minus[0], minus[1], minus[2]);
+                        for (int i = 0; i < 3; ++i)
+                            for (int j = 0; j < 3; ++j)
+                            {
+                                const float finite_difference = (hp.hessian[i][j] - hm.hessian[i][j]) / (2 * step);
+                                require(std::abs(third.third[i][j][axis] - finite_difference)
+                                    < 0.05f * std::max(std::abs(third.third[i][j][axis]), 1.0f) + 0.5f,
+                                    "analytic third derivative disagrees with Hessian difference");
+                            }
+                    }
+                    ++third_checked;
+                }
+            }
+        }
+        // At each opposite-corner selection plane the selected contribution
+        // has zero support; the complete third-order field remains continuous.
+        {
+            FastNoiseLite noise(811);
+            noise.SetFrequency(1.0f);
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                double q[3] = {0.6, 0.6, 0.6};
+                q[axis] = 0.7;
+                double point[3];
+                source_to_world(q, point, FastNoiseLite::RotationType3D_None, 1.0f);
+                const auto center = noise.GetOpenSimplex2SWithThirdDerivatives(point[0], point[1], point[2]);
+                for (double offset : {-1e-5, 1e-5})
+                {
+                    double nearby_q[3] = {q[0], q[1], q[2]};
+                    double nearby[3];
+                    nearby_q[axis] += offset;
+                    source_to_world(nearby_q, nearby, FastNoiseLite::RotationType3D_None, 1.0f);
+                    const auto sample = noise.GetOpenSimplex2SWithThirdDerivatives(nearby[0], nearby[1], nearby[2]);
+                    for (int i = 0; i < 3; ++i)
+                        for (int j = 0; j < 3; ++j)
+                            for (int k = 0; k < 3; ++k)
+                                require(std::abs(center.third[i][j][k] - sample.third[i][j][k]) < 0.08f,
+                                    "third derivative is discontinuous at a corner-selection plane");
+                }
+            }
+            double support_q[3] = {0.0, 0.0, 0.0};
+            double support_point[3];
+            support_q[0] = std::sqrt(0.75);
+            source_to_world(support_q, support_point, FastNoiseLite::RotationType3D_None, 1.0f);
+            const auto support = noise.GetOpenSimplex2SWithThirdDerivatives(
+                support_point[0], support_point[1], support_point[2]);
+            for (double offset : {-1e-5, 1e-5})
+            {
+                double nearby_q[3] = {support_q[0] + offset, support_q[1], support_q[2]};
+                double nearby[3];
+                source_to_world(nearby_q, nearby, FastNoiseLite::RotationType3D_None, 1.0f);
+                const auto sample = noise.GetOpenSimplex2SWithThirdDerivatives(nearby[0], nearby[1], nearby[2]);
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        for (int k = 0; k < 3; ++k)
+                            require(std::isfinite(sample.third[i][j][k])
+                                && std::abs(support.third[i][j][k] - sample.third[i][j][k]) < 0.08f,
+                                "third derivative is discontinuous at a support exit");
+            }
+        }
         // Transport the known old source seam into every orientation, rather
         // than treating its old world coordinates as source coordinates.
         const double old_point[3] = {-1.02741, -1.75862226094, 0.533843};
@@ -267,7 +368,8 @@ int main()
         }
         std::cout << "Checked " << checked << " float/double samples, " << seam_checked
                   << " former-seam fixtures, " << hessian_checked
-                  << " Hessian fixtures, and " << oracle_checked
+                  << " Hessian fixtures, " << third_checked
+                  << " third-derivative fixtures, and " << oracle_checked
                   << " independent complete-support points; fused/value-only values exact; maximum derivative error "
                   << maximum_error << '\n';
     }

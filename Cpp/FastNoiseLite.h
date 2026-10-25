@@ -71,6 +71,17 @@ public:
         float hessian[3][3];
     };
 
+    struct NoiseThirdDerivatives3D
+    {
+        float value;
+        float dx;
+        float dy;
+        float dz;
+        float hessian[3][3];
+        float third[3][3][3];
+    };
+
+
     enum NoiseType
     {
         NoiseType_OpenSimplex2,
@@ -479,6 +490,108 @@ public:
         }
         return result;
     }
+    /// Raw 3D OpenSimplex2S value and analytic Cartesian derivatives through order three.
+    /// Uses seed, frequency and RotationType3D; ignores noise/fractal type.
+    /// Derivatives are with respect to the original input coordinates.
+    template <typename FNfloat>
+    NoiseThirdDerivatives3D GetOpenSimplex2SWithThirdDerivatives(FNfloat x, FNfloat y, FNfloat z) const
+    {
+        Arguments_must_be_floating_point_values<FNfloat>();
+        TransformType3D transform = TransformType3D_DefaultOpenSimplex2;
+        if (mRotationType3D == RotationType3D_ImproveXYPlanes)
+            transform = TransformType3D_ImproveXYPlanes;
+        else if (mRotationType3D == RotationType3D_ImproveXZPlanes)
+            transform = TransformType3D_ImproveXZPlanes;
+        TransformNoiseCoordinate(x, y, z, transform);
+
+        NoiseThirdDerivatives3D result = {};
+        NoiseGradient3D gradient = {0, 0, 0, 0};
+        result.value = SingleOpenSimplex2S<true, true, true>(
+            mSeed, x, y, z, &gradient, result.hessian, result.third);
+        result.dx = gradient.dx;
+        result.dy = gradient.dy;
+        result.dz = gradient.dz;
+
+        FNfloat matrix[3][3];
+        const FNfloat a = (FNfloat)-0.211324865405187;
+        const FNfloat b = (FNfloat)0.577350269189626;
+        if (transform == TransformType3D_ImproveXYPlanes)
+        {
+            matrix[0][0] = 1 + a; matrix[0][1] = a;     matrix[0][2] = -b;
+            matrix[1][0] = a;     matrix[1][1] = 1 + a; matrix[1][2] = -b;
+            matrix[2][0] = b;     matrix[2][1] = b;     matrix[2][2] = b;
+        }
+        else if (transform == TransformType3D_ImproveXZPlanes)
+        {
+            matrix[0][0] = 1 + a; matrix[0][1] = -b;    matrix[0][2] = a;
+            matrix[1][0] = b;     matrix[1][1] = b;     matrix[1][2] = b;
+            matrix[2][0] = a;     matrix[2][1] = -b;    matrix[2][2] = 1 + a;
+        }
+        else
+        {
+            matrix[0][0] = (FNfloat)-1.0/3.0; matrix[0][1] = (FNfloat)2.0/3.0; matrix[0][2] = (FNfloat)2.0/3.0;
+            matrix[1][0] = (FNfloat)2.0/3.0; matrix[1][1] = (FNfloat)-1.0/3.0; matrix[1][2] = (FNfloat)2.0/3.0;
+            matrix[2][0] = (FNfloat)2.0/3.0; matrix[2][1] = (FNfloat)2.0/3.0; matrix[2][2] = (FNfloat)-1.0/3.0;
+        }
+        FNfloat source[3][3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                    source[i][j][k] = result.third[i][j][k];
+        const FNfloat scale = (FNfloat)mFrequency * (FNfloat)mFrequency * (FNfloat)mFrequency;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                {
+                    FNfloat value = 0;
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b)
+                            for (int c = 0; c < 3; ++c)
+                                value += matrix[a][i] * matrix[b][j] * matrix[c][k] * source[a][b][c];
+                    result.third[i][j][k] = (float)(value * scale);
+                }
+        result.dx *= mFrequency;
+        result.dy *= mFrequency;
+        result.dz *= mFrequency;
+        FNfloat source_hessian[3][3];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                source_hessian[i][j] = result.hessian[i][j];
+        const FNfloat hessian_scale = (FNfloat)mFrequency * (FNfloat)mFrequency;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                FNfloat value = 0;
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b)
+                        value += matrix[a][i] * source_hessian[a][b] * matrix[b][j];
+                result.hessian[i][j] = (float)(value * hessian_scale);
+            }
+        const FNfloat gx = gradient.dx, gy = gradient.dy, gz = gradient.dz;
+        if (transform == TransformType3D_ImproveXYPlanes)
+        {
+            FNfloat s = a * (gx + gy) + b * gz;
+            result.dx = (float)((gx + s) * mFrequency);
+            result.dy = (float)((gy + s) * mFrequency);
+            result.dz = (float)(b * (gz - gx - gy) * mFrequency);
+        }
+        else if (transform == TransformType3D_ImproveXZPlanes)
+        {
+            FNfloat s = a * (gx + gz) + b * gy;
+            result.dx = (float)((gx + s) * mFrequency);
+            result.dy = (float)(b * (gy - gx - gz) * mFrequency);
+            result.dz = (float)((gz + s) * mFrequency);
+        }
+        else
+        {
+            FNfloat r = (gx + gy + gz) * (FNfloat)(2.0 / 3.0);
+            result.dx = (float)((r - gx) * mFrequency);
+            result.dy = (float)((r - gy) * mFrequency);
+            result.dz = (float)((r - gz) * mFrequency);
+        }
+        return result;
+    }
+
 
 
     /// <summary>
@@ -686,9 +799,10 @@ private:
         return GradCoordWithDerivative<false>(seed, xPrimed, yPrimed, zPrimed, xd, yd, zd, 0, nullptr);
     }
 
-    template <bool Derivatives, bool Hessians = false>
+    template <bool Derivatives, bool Hessians = false, bool ThirdDerivatives = false>
     float GradCoordWithDerivative(int seed, int xPrimed, int yPrimed, int zPrimed,
-        float xd, float yd, float zd, float a, NoiseGradient3D* gradient, float hessian[3][3] = nullptr) const
+        float xd, float yd, float zd, float a, NoiseGradient3D* gradient, float hessian[3][3] = nullptr,
+        float third[3][3][3] = nullptr) const
     {
         int hash = Hash(seed, xPrimed, yPrimed, zPrimed);
         hash ^= hash >> 15;
@@ -717,6 +831,27 @@ private:
                         hessian[row][column] += radial_second * coordinates[row] * coordinates[column]
                             + cross * (dot * (row == column) + coordinates[row] * gradient_values[column]
                                 + gradient_values[row] * coordinates[column]);
+            }
+            if (ThirdDerivatives)
+            {
+                const float coordinates[3] = {xd, yd, zd};
+                const float gradient_values[3] = {xg, yg, zg};
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        for (int k = 0; k < 3; ++k)
+                        {
+                            const float delta_ij = i == j;
+                            const float delta_ik = i == k;
+                            const float delta_jk = j == k;
+                            third[i][j][k] += -192.0f * a * dot * coordinates[i] * coordinates[j] * coordinates[k]
+                                + 48.0f * aa * (gradient_values[i] * coordinates[j] * coordinates[k]
+                                    + gradient_values[j] * coordinates[i] * coordinates[k]
+                                    + gradient_values[k] * coordinates[i] * coordinates[j]
+                                    + dot * (delta_ij * coordinates[k] + delta_ik * coordinates[j]
+                                        + delta_jk * coordinates[i]))
+                                - 8.0f * aa * a * (gradient_values[i] * delta_jk
+                                    + gradient_values[j] * delta_ik + gradient_values[k] * delta_ij);
+                        }
             }
         }
         return dot;
@@ -1459,9 +1594,9 @@ private:
         return value * 18.24196194486065f;
     }
 
-    template <bool Derivatives = false, bool Hessians = false, typename FNfloat>
+    template <bool Derivatives = false, bool Hessians = false, bool ThirdDerivatives = false, typename FNfloat>
     float SingleOpenSimplex2S(int seed, FNfloat x, FNfloat y, FNfloat z, NoiseGradient3D* gradient = nullptr,
-        float hessian[3][3] = nullptr) const
+        float hessian[3][3] = nullptr, float third[3][3][3] = nullptr) const
     {
         int i = FastFloor(x);
         int j = FastFloor(y);
@@ -1503,12 +1638,12 @@ private:
                 float a = 0.75f - xd * xd - yd * yd - zd * zd;
                 if (a > 0)
                 {
-                    value += (a * a) * (a * a) * GradCoordWithDerivative<Derivatives, Hessians>(
+                    value += (a * a) * (a * a) * GradCoordWithDerivative<Derivatives, Hessians, ThirdDerivatives>(
                         seed, i + vx * PrimeX, j + vy * PrimeY, k + vz * PrimeZ,
-                        xd, yd, zd, a, gradient, hessian);
+                        xd, yd, zd, a, gradient, hessian, third);
                 }
-            }
 
+            }
             if (lattice == 0)
             {
                 // The second grid samples p + .5 and hashes its integer
@@ -1534,6 +1669,11 @@ private:
             for (int row = 0; row < 3; ++row)
                 for (int column = 0; column < 3; ++column)
                     hessian[row][column] *= normalization;
+        if (ThirdDerivatives)
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    for (int k = 0; k < 3; ++k)
+                        third[i][j][k] *= normalization;
         return value * normalization;
     }
 
