@@ -550,9 +550,6 @@ public:
                                 value += matrix[a][i] * matrix[b][j] * matrix[c][k] * source[a][b][c];
                     result.third[i][j][k] = (float)(value * scale);
                 }
-        result.dx *= mFrequency;
-        result.dy *= mFrequency;
-        result.dz *= mFrequency;
         FNfloat source_hessian[3][3];
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 3; ++j)
